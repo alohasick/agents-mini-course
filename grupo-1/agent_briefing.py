@@ -1,12 +1,13 @@
 import os
+from pprint import pprint
 import requests
 from typing import Dict, List, Any, Optional
 
 from dotenv import load_dotenv
 
 from langchain_openai import ChatOpenAI
-from langchain.agents import AgentExecutor
-from langchain.tools import Tool
+from langchain.tools import tool
+from langchain.messages import HumanMessage, ToolMessage
 
 load_dotenv()
 
@@ -119,16 +120,24 @@ def fetch_advice() -> str:
     except Exception:
         return "Mantenha o foco e siga em frente."
 
+@tool
+def _tool_location() -> str:
+    """Infer user location by IP using ipinfo.io (public, no key required for basic info).
 
-def _tool_location(_: str) -> str:
+    Returns: dict with city, region, country, loc (lat,lon)
+    """
     loc = get_location()
     city = loc.get("city")
     region = loc.get("region")
     country = loc.get("country")
     return f"{city or ''}, {region or ''}, {country or ''} | loc={loc.get('loc')}"
 
-
+@tool
 def _tool_news(input_text: str) -> str:
+    """Fetch top headlines from gnews.io. Expects API key in `gnews_key`.
+
+    Returns list of {title, description, url}
+    """
     key = os.getenv("GNEWS_API_KEY")
     # input may contain a country code or city; try to use country if provided
     country = None
@@ -140,8 +149,9 @@ def _tool_news(input_text: str) -> str:
         out.append(f"- {a.get('title')}: {a.get('description')}")
     return "\n".join(out)
 
-
+@tool
 def _tool_weather(input_text: str) -> str:
+    """Fetch current weather from OpenWeatherMap using lat/lon. Returns summary dict."""
     key = os.getenv("OPENWEATHER_API_KEY")
     # input_text expected to be 'lat,lon'
     if not input_text:
@@ -152,8 +162,9 @@ def _tool_weather(input_text: str) -> str:
         return f"Erro: {w['error']}"
     return f"{w.get('temp')}°C, {w.get('description')} (sensação {w.get('feels_like')}°C)"
 
-
+@tool
 def _tool_exchange(input_text: str) -> str:
+    """Fetch USD -> target_currency conversion using exchangerate.host"""
     # input_text expected to be currency code like BRL
     target = input_text.strip().upper() if input_text else "BRL"
     r = fetch_usd_rate(target)
@@ -161,12 +172,13 @@ def _tool_exchange(input_text: str) -> str:
         return f"Erro: {r['error']}"
     return f"1 USD = {r.get('rate')} {target}"
 
-
-def _tool_advice(_: str) -> str:
+@tool
+def _tool_advice() -> str:
+    """Fetch a motivational advice phrase."""
     return fetch_advice()
 
 
-def create_agent():
+def create_agent() -> ChatOpenAI:
     """
     Create a lightweight agent object compatible with LangChain v1.0.1 usage in this script.
 
@@ -174,87 +186,66 @@ def create_agent():
     between LangChain versions), we return the LLM instance and a mapping of tool
     callables. This keeps the code explicit and compatible with v1+.
     """
-    llm = ChatOpenAI(temperature=0.2)
+    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.2)
 
-    # wrap our python callables as LangChain Tools
-    tools = [
-        Tool(name="location", func=_tool_location, description="Retorna a localização do usuário inferida por IP. Input ignored."),
-        Tool(name="news", func=_tool_news, description="Busca notícias recentes. Input: country code (ex: BR) ou vazio."),
-        Tool(name="weather", func=_tool_weather, description="Retorna o clima atual. Input: 'lat,lon'."),
-        Tool(name="exchange", func=_tool_exchange, description="Retorna cotação USD->moeda. Input: target currency code (ex: BRL)."),
-        Tool(name="advice", func=_tool_advice, description="Retorna uma frase motivacional curta."),
-    ]
+    with_tools = llm.bind_tools([_tool_location, _tool_advice, _tool_exchange, _tool_news, _tool_weather])
+    prompt = (
+        "Você é um assistente que produz um briefing curto e objetivo em português (PT-BR). "
+        "Use as ferramentas disponíveis para: 1) inferir a localização do usuário; "
+        "2) obter notícias recentes relevantes para o país/município; 3) obter o clima atual a partir das coordenadas; "
+        "4) obter a cotação atual do dólar na moeda local; 5) finalizar com uma frase motivacional. "
+        "Responda de forma casual, direta e em poucas frases."
+    )
+    # result = with_tools.invoke([HumanMessage(content=prompt)])
+    # print('setup prompt result:')
+    # print(result.to_json())
+    return with_tools
 
-    # Create an AgentExecutor from the LLM and the tools. This uses the v1.x API.
-    agent_executor = AgentExecutor.from_llm_and_tools(llm=llm, tools=tools, verbose=False)
-    return agent_executor
 
-
-def build_briefing() -> str:
+def build_briefing() -> dict[str, Any]:
     """Runs the agent to produce a briefing in Portuguese, casual and objective.
 
     It will: infer location, fetch news for the country, weather for coordinates, USD rate to local currency, and an advice.
     """
-    gnews_key = os.getenv("GNEWS_API_KEY")
-    owm_key = os.getenv("OPENWEATHER_API_KEY")
-
-    loc = get_location()
-    lat = (loc.get("loc") or {}).get("lat") if isinstance(loc.get("loc"), dict) else None
-    lon = (loc.get("loc") or {}).get("lon") if isinstance(loc.get("loc"), dict) else None
-    # ipinfo returned loc as string 'lat,lon' originally; adapt
-    raw_loc = loc.get("loc")
-    if isinstance(raw_loc, str) and "," in raw_loc:
-        lat, lon = raw_loc.split(",")
-
-    country = loc.get("country")
-    # choose currency
-    currency = COUNTRY_TO_CURRENCY.get(country or "", "BRL")
 
     # Build a prompt that instructs the AgentExecutor to use the provided tools.
     # The AgentExecutor will call the tools (location, news, weather, exchange, advice)
     # and produce the final briefing in Portuguese.
-    try:
-        agent = create_agent()
-        prompt = (
-            "Você é um assistente que produz um briefing curto e objetivo em português (PT-BR). "
-            "Use as ferramentas disponíveis para: 1) inferir a localização do usuário; "
-            "2) obter notícias recentes relevantes para o país/município; 3) obter o clima atual a partir das coordenadas; "
-            "4) obter a cotação atual do dólar na moeda local; 5) finalizar com uma frase motivacional. "
-            "Responda de forma casual, direta e em poucas frases."
-        )
-        result = agent.run(prompt)
-        if isinstance(result, str):
-            return result.strip()
-        return str(result)
-    except Exception:
-        # fallback to the previous local assembly if the AgentExecutor fails
-        news = fetch_news(gnews_key, country=country)
-        weather = fetch_weather(owm_key, lat, lon)
-        rate = fetch_usd_rate(currency)
-        advice = fetch_advice()
+    system_prompt = (
+        "Você é um assistente que produz um briefing curto e objetivo em português (PT-BR). "
+        "Use as ferramentas disponíveis para: 1) inferir a minha localização; "
+        "2) obter notícias recentes relevantes para o país/município que estou; 3) obter o clima atual a partir das coordenadas; "
+        "4) obter a cotação atual do dólar na moeda local; 5) finalizar com uma frase motivacional. "
+        "Responda de forma casual, direta e em poucas frases."
+    )
+    agent = create_agent()
+    user_prompt = "olá"
+    full_prompt = system_prompt + "\n" + user_prompt
+    result = agent.invoke([HumanMessage(content=full_prompt)])
+    if hasattr(result, "tool_calls") and result.tool_calls:
+        for call in result.tool_calls:
+            tool_name = call['name']
+            args = call['args']
+            print(f"[Tool called: {tool_name}({args})]")
+            if tool_name == "_tool_location":
 
-        city = loc.get("city") or "sua cidade"
-        temp = f"{weather.get('temp')}°C" if weather and "temp" in weather and weather.get('temp') is not None else "desconhecido"
-        weather_desc = weather.get("description") if isinstance(weather, dict) else None
+                location_result = _tool_location.invoke(args)
+                print(f"[Tool output: {location_result}]")
+                location_message = ToolMessage(
+                    name=tool_name,
+                    content=str(location_result),
+                    tool_call_id=call["id"]
+                )
+                print(f"[Tool result: {location_message}]")
+                followup = agent.invoke([
+                    HumanMessage(content=full_prompt),
+                    result,
+                    location_message
+                ])
+                print(followup.content)
+                result = followup
 
-        headlines = []
-        for a in (news or [])[:3]:
-            t = a.get("title")
-            if t:
-                headlines.append(t)
-
-        rate_text = f"1 USD = {rate.get('rate')} {currency}" if rate and rate.get("rate") else "cotação não disponível"
-
-        parts = []
-        parts.append(f"Bom dia! No momento em {city} está {temp}{(' — ' + weather_desc) if weather_desc else ''}.")
-        if headlines:
-            parts.append("Notícias recentes: " + "; ".join(headlines) + ".")
-        else:
-            parts.append("Não encontrei notícias recentes no momento.")
-        parts.append(f"A cotação atual do dólar é {rate_text}.")
-        parts.append(advice)
-
-        return "\n\n".join(parts)
+    return result.to_json()
 
 
 if __name__ == "__main__":
@@ -262,6 +253,6 @@ if __name__ == "__main__":
     print("Gerando briefing...\n")
     try:
         text = build_briefing()
-        print(text)
+        pprint(text)
     except Exception as e:
         print("Erro ao gerar briefing:", e)
